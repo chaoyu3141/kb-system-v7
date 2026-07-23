@@ -1,0 +1,101 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String
+  password  String
+  avatar    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  ownedKbs       KnowledgeBase[]
+  documents      Document[]
+  permissions    Permission[]
+  documentVersions DocumentVersion[]
+  sessions       Session[]
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  token        String   @unique
+  userId       String
+  createdAt    DateTime @default(now())
+  expiresAt    DateTime
+  revokedAt    DateTime?
+
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model KnowledgeBase {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  icon        String?
+  ownerId     String
+  owner       User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  documents   Document[]
+  permissions Permission[]
+}
+
+model Document {
+  id              String   @id @default(cuid())
+  title           String
+  content         String?
+  docType         String   @default("doc") // "doc" | "markdown" | "sheet"
+  icon            String?
+  knowledgeBaseId String
+  parentId        String?
+  authorId        String
+  order           Int      @default(0)
+  shareEnabled    Boolean  @default(false)
+  shareToken      String?  @unique
+  shareExpireAt   DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  knowledgeBase   KnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  parent          Document?     @relation("DocTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children        Document[]    @relation("DocTree")
+  author          User          @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  versions        DocumentVersion[]
+}
+
+model DocumentVersion {
+  id          String   @id @default(cuid())
+  documentId  String
+  title       String
+  content     String?
+  version     Int
+  editorId    String
+  createdAt   DateTime @default(now())
+
+  document    Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  editor      User     @relation(fields: [editorId], references: [id], onDelete: Cascade)
+}
+
+model Permission {
+  id           String   @id @default(cuid())
+  userId       String
+  resourceType String   // "knowledge_base"
+  resourceId   String
+  role         String   // "owner" | "editor" | "viewer"
+  createdAt    DateTime @default(now())
+
+  user         User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  knowledgeBase KnowledgeBase? @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, resourceType, resourceId])
+}
