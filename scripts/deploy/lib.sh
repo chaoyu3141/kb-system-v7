@@ -184,17 +184,20 @@ step_backup_db() {
   success "数据库已备份：${backup_file}"
 
   # 清理旧备份，仅保留最近 KEEP_BACKUPS 份
-  local -a old_backups
-  mapfile -t old_backups < <(
-    find "$BACKUP_DIR" -maxdepth 1 -type f -name 'dev-*.db' \
-      -printf '%T@ %p\n' |
-    sort -nr |
-    awk -v keep="$KEEP_BACKUPS" 'NR > keep {print $2}'
-  )
+  # KEEP_BACKUPS <= 0 时不清理，避免误删全部备份
+  if (( KEEP_BACKUPS > 0 )); then
+    local -a old_backups
+    mapfile -t old_backups < <(
+      find "$BACKUP_DIR" -maxdepth 1 -type f -name 'dev-*.db' \
+        -printf '%T@ %p\n' |
+      sort -nr |
+      awk -v keep="$KEEP_BACKUPS" 'NR > keep {print $2}'
+    )
 
-  if (( ${#old_backups[@]} > 0 )); then
-    rm -f -- "${old_backups[@]}"
-    success "已清理旧备份，仅保留最近 ${KEEP_BACKUPS} 份"
+    if (( ${#old_backups[@]} > 0 )); then
+      rm -f -- "${old_backups[@]}"
+      success "已清理旧备份，仅保留最近 ${KEEP_BACKUPS} 份"
+    fi
   fi
 }
 
@@ -203,6 +206,18 @@ step_backup_db() {
 # ==============================
 step_install_deps() {
   info "【3/7】正在检查依赖变化"
+
+  # node_modules 不存在时必须安装（首次部署或被清理）
+  if [[ ! -d "${APP_DIR}/node_modules" ]]; then
+    info "node_modules 不存在，执行首次依赖安装"
+    if [[ -f "$LOCK_FILE_PATH" ]]; then
+      npm ci
+    else
+      npm install
+    fi
+    success "依赖安装完成"
+    return
+  fi
 
   if ! file_changed '(^|/)(package\.json|package-lock\.json)$'; then
     success "依赖没有变化，跳过安装"
@@ -241,10 +256,13 @@ step_sync_prisma() {
 step_build() {
   info "【5/7】开始构建生产版本"
 
+  local standalone_dir="${APP_DIR}/.next/standalone"
+  local standalone_prev_dir="${APP_DIR}/.next/standalone-prev"
+
   # 保留上一版构建产物，供 rollback 使用
-  if [[ -d ".next/standalone" ]]; then
-    rm -rf .next/standalone-prev
-    cp -r .next/standalone .next/standalone-prev
+  if [[ -d "$standalone_dir" ]]; then
+    rm -rf "$standalone_prev_dir"
+    cp -r "$standalone_dir" "$standalone_prev_dir"
   fi
 
   # package.json 已固定为 next build --webpack
@@ -252,6 +270,15 @@ step_build() {
 
   [[ -f "$BUILD_OUTPUT" ]] \
     || fail "构建结束，但没有生成 ${BUILD_OUTPUT}"
+
+  # 验证 standalone 静态资源与 public 已正确复制
+  if [[ ! -d "${standalone_dir}/.next/static" ]]; then
+    fail "构建产物缺少 .next/standalone/.next/static，请检查 package.json build 脚本"
+  fi
+
+  if [[ -d "${APP_DIR}/public" && ! -d "${standalone_dir}/public" ]]; then
+    fail "构建产物缺少 .next/standalone/public，请检查 package.json build 脚本"
+  fi
 
   success "Webpack 生产构建成功"
 }
@@ -355,10 +382,15 @@ cmd_restart() {
   success "重启命令执行完成"
 }
 
-# health：仅健康检查
+# health：仅健康检查（只读，不要求 root，不写日志）
 cmd_health() {
   require_app_directory
-  prepare_runtime
+
+  printf '\n========================================\n'
+  printf ' %s 健康检查\n' "$APP_DISPLAY_NAME"
+  printf ' 目标：%s\n' "$HEALTH_URL"
+  printf '========================================\n'
+
   step_health_check
   success "健康检查命令执行完成"
 }
@@ -388,7 +420,7 @@ cmd_status() {
   printf ' 提交时间：%s\n' "$(get_current_commit_date)"
 
   # 可回滚版本
-  if [[ -d ".next/standalone-prev" ]]; then
+  if [[ -d "${APP_DIR}/.next/standalone-prev" ]]; then
     printf ' 可回滚版本：是（.next/standalone-prev 存在）\n'
   else
     printf ' 可回滚版本：否（无上一版本构建）\n'
@@ -421,17 +453,23 @@ cmd_rollback() {
   prepare_runtime
   acquire_deploy_lock
 
+  local standalone_dir="${APP_DIR}/.next/standalone"
+  local standalone_prev_dir="${APP_DIR}/.next/standalone-prev"
+
   warning "rollback 仅回滚代码构建，不回滚数据库"
   warning "如需恢复数据，请手动从 ${BACKUP_DIR} 选择对应时间点的备份恢复"
 
-  if [[ ! -d ".next/standalone-prev" ]]; then
+  if [[ ! -d "$standalone_prev_dir" ]]; then
     fail "没有可回滚的上一版本构建（.next/standalone-prev 不存在）"
   fi
 
+  # 回滚前备份数据库（安全网，不自动覆盖现有数据库）
+  step_backup_db
+
   info "正在回滚到上一版本构建..."
 
-  rm -rf .next/standalone
-  mv .next/standalone-prev .next/standalone
+  rm -rf "$standalone_dir"
+  mv "$standalone_prev_dir" "$standalone_dir"
 
   success "已切换到上一版本构建"
 
