@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # deploy.sh — 部署命令入口
 # 用法：./scripts/deploy/deploy.sh <command>
-# 命令：deploy | backup | restart | health | status | version | rollback | help
+# 命令：deploy | preflight | backup | restart | health | status | version | rollback | help
 
 # 定位脚本所在目录（支持从任意路径调用）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

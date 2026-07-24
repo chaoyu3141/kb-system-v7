@@ -505,6 +505,197 @@ cmd_deploy() {
   print_deploy_summary
 }
 
+# preflight：部署前只读预检（不执行任何写操作，不构建，不重启）
+# 用途：首次部署前验证环境就绪，提前暴露必失败的问题
+cmd_preflight() {
+  require_root_user
+  require_app_directory
+
+  local pass_count=0
+  local fail_count=0
+  local warn_count=0
+  local will_install_deps=false
+  local will_sync_prisma=false
+  local incoming_changes=""
+
+  preflight_pass() { printf '  \033[1;32m✓\033[0m %s\n' "$1"; ((pass_count++)); }
+  preflight_fail() { printf '  \033[1;31m✗\033[0m %s\n' "$1"; ((fail_count++)); }
+  preflight_warn() { printf '  \033[1;33m!\033[0m %s\n' "$1"; ((warn_count++)); }
+
+  printf '\n========================================\n'
+  printf ' %s 部署预检（Dry Run）\n' "$APP_DISPLAY_NAME"
+  printf ' 时间：%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  printf '========================================\n'
+
+  info "【1/6】基础环境检查"
+  # 必需命令
+  local missing_cmds=()
+  local cmd
+  for cmd in git npm npx systemctl curl sqlite3 flock; do
+    command -v "$cmd" >/dev/null 2>&1 || missing_cmds+=("$cmd")
+  done
+  if (( ${#missing_cmds[@]} == 0 )); then
+    preflight_pass "必需命令齐全：git npm npx systemctl curl sqlite3 flock"
+  else
+    preflight_fail "缺少命令：${missing_cmds[*]}"
+  fi
+
+  # 项目目录
+  if [[ -d "$APP_DIR" ]]; then
+    preflight_pass "项目目录存在：$APP_DIR"
+  else
+    preflight_fail "项目目录不存在：$APP_DIR"
+  fi
+
+  info "【2/6】Git 仓库检查"
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    preflight_pass "是 Git 仓库"
+  else
+    preflight_fail "不是 Git 仓库"
+  fi
+
+  # 工作区干净
+  if [[ -z "$(git status --porcelain)" ]]; then
+    preflight_pass "工作区干净"
+  else
+    preflight_fail "工作区有未提交/未跟踪文件（部署会拒绝）"
+    git status --short | head -10
+  fi
+
+  # 分支
+  local current_branch
+  current_branch=$(git branch --show-current 2>/dev/null || echo "")
+  if [[ "$current_branch" == "$GIT_BRANCH" ]]; then
+    preflight_pass "当前分支：$GIT_BRANCH"
+  else
+    preflight_fail "当前分支是 ${current_branch}，要求 ${GIT_BRANCH}"
+  fi
+
+  info "【3/6】远程代码检查"
+  # fetch（只下载对象，不改动工作区，安全）
+  if git fetch "$GIT_REMOTE" "$GIT_BRANCH" 2>/dev/null; then
+    preflight_pass "远程可访问，fetch 成功"
+  else
+    preflight_fail "无法 fetch 远程 ${GIT_REMOTE}/${GIT_BRANCH}"
+  fi
+
+  # 待拉取变更
+  local local_head remote_head
+  local_head=$(git rev-parse HEAD 2>/dev/null || echo "")
+  remote_head=$(git rev-parse "${GIT_REMOTE}/${GIT_BRANCH}" 2>/dev/null || echo "")
+  if [[ "$local_head" == "$remote_head" ]]; then
+    preflight_warn "代码已是最新，无待拉取变更"
+    incoming_changes=""
+  else
+    incoming_changes=$(git diff --name-only "$local_head" "$remote_head" 2>/dev/null || echo "")
+    local change_count
+    change_count=$(echo "$incoming_changes" | grep -c . 2>/dev/null || echo 0)
+    preflight_pass "待拉取变更：${change_count} 个文件"
+    echo "$incoming_changes" | head -10 | while read -r f; do
+      [[ -n "$f" ]] && printf '     - %s\n' "$f"
+    done
+  fi
+
+  info "【4/6】数据库与环境检查"
+  # 数据库
+  if [[ -f "$DB_FILE" ]]; then
+    local db_check
+    db_check=$(sqlite3 "$DB_FILE" "PRAGMA quick_check;" 2>/dev/null || echo "error")
+    if [[ "$db_check" == "ok" ]]; then
+      preflight_pass "数据库存在且完整：$DB_FILE"
+    else
+      preflight_fail "数据库完整性检查失败：$db_check"
+    fi
+  else
+    preflight_warn "数据库不存在（首次部署，备份步骤将跳过）"
+  fi
+
+  # .env
+  local env_file="${APP_DIR}/.env"
+  if [[ -f "$env_file" ]]; then
+    preflight_pass ".env 存在"
+    # 检查 DATABASE_URL 是否绝对路径
+    local db_url
+    db_url=$(grep -E '^DATABASE_URL=' "$env_file" 2>/dev/null | head -1 || echo "")
+    if [[ -z "$db_url" ]]; then
+      preflight_warn ".env 未配置 DATABASE_URL"
+    elif [[ "$db_url" =~ DATABASE_URL=\"file:/ ]]; then
+      preflight_pass "DATABASE_URL 使用绝对路径"
+    else
+      preflight_fail "DATABASE_URL 不是绝对路径（standalone 模式会找不到数据库）"
+      printf '     当前值：%s\n' "$db_url"
+    fi
+  else
+    preflight_fail ".env 不存在：$env_file"
+  fi
+
+  # node_modules
+  if [[ -d "${APP_DIR}/node_modules" ]]; then
+    preflight_pass "node_modules 存在"
+  else
+    preflight_warn "node_modules 不存在 → 部署时会执行 npm ci/install"
+    will_install_deps=true
+  fi
+
+  info "【5/6】服务配置检查"
+  # systemd 服务单元
+  if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${SERVICE_NAME}\.service"; then
+    preflight_pass "systemd 服务已安装：${SERVICE_NAME}.service"
+    local svc_state
+    svc_state=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo "unknown")
+    printf '     当前状态：%s\n' "$svc_state"
+  else
+    preflight_fail "systemd 服务未安装：${SERVICE_NAME}.service（请先 cp zhinanguanxin.service 到 /etc/systemd/system/）"
+  fi
+
+  # Nginx（可选，仅提示）
+  if [[ -f "/etc/nginx/sites-enabled/${APP_NAME}" ]] || [[ -f "/etc/nginx/conf.d/${APP_NAME}.conf" ]]; then
+    preflight_pass "Nginx 站点已配置"
+  else
+    preflight_warn "未检测到 Nginx 站点配置（如不使用 Nginx 可忽略）"
+  fi
+
+  info "【6/6】执行计划预览"
+  # 判断是否会装依赖
+  if [[ "$will_install_deps" != true ]] && [[ -n "$incoming_changes" ]]; then
+    if grep -Eq '(^|/)(package\.json|package-lock\.json)$' <<< "$incoming_changes"; then
+      will_install_deps=true
+    fi
+  fi
+  # 判断是否会同步 Prisma
+  if [[ -n "$incoming_changes" ]] && grep -Eq '(^|/)prisma/schema\.prisma$' <<< "$incoming_changes"; then
+    will_sync_prisma=true
+  fi
+
+  printf '  1. 备份数据库 → %s/dev-{时间戳}.db\n' "$BACKUP_DIR"
+  if [[ "$will_install_deps" == true ]]; then
+    printf '  2. 安装依赖 → %s\n' "$([[ -f "$LOCK_FILE_PATH" ]] && echo "npm ci" || echo "npm install")"
+  else
+    printf '  2. 安装依赖 → 跳过（依赖无变化）\n'
+  fi
+  if [[ "$will_sync_prisma" == true ]]; then
+    printf '  3. Prisma → prisma generate + db push（schema 有变化）\n'
+  else
+    printf '  3. Prisma → 跳过（schema 无变化）\n'
+  fi
+  printf '  4. 构建 → next build --webpack\n'
+  printf '  5. 重启 → systemctl restart %s\n' "$SERVICE_NAME"
+  printf '  6. 健康检查 → %s\n' "$HEALTH_URL"
+
+  printf '\n========================================\n'
+  printf ' 预检结果：%s 通过 / %s 警告 / %s 失败\n' "$pass_count" "$warn_count" "$fail_count"
+  if (( fail_count > 0 )); then
+    printf '\033[1;31m 不可部署：存在 %s 项失败，请先修复\033[0m\n' "$fail_count"
+    printf '========================================\n'
+    exit 1
+  elif (( warn_count > 0 )); then
+    printf '\033[1;33m 可以部署：有 %s 项提示，部署时会自动处理\033[0m\n' "$warn_count"
+  else
+    printf '\033[1;32m 可以部署：环境完全就绪\033[0m\n'
+  fi
+  printf '========================================\n'
+}
+
 # ==============================
 # 命令分发
 # ==============================
@@ -514,6 +705,7 @@ show_usage() {
 
 可用命令：
   deploy     执行完整部署流程（拉代码 → 备份 → 依赖 → Prisma → 构建 → 重启 → 健康检查）
+  preflight  部署前只读预检（Dry Run，不执行任何写操作）
   backup     仅备份数据库
   restart    仅重启 systemd 服务
   health     仅执行健康检查
@@ -530,6 +722,7 @@ dispatch() {
 
   case "$command" in
     deploy)    cmd_deploy "$@" ;;
+    preflight) cmd_preflight "$@" ;;
     backup)    cmd_backup "$@" ;;
     restart)  cmd_restart "$@" ;;
     health)   cmd_health "$@" ;;
