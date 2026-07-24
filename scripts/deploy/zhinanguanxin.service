@@ -1,0 +1,77 @@
+# zhinanguanxin.service — systemd 服务单元文件
+# 知南观心知识库 Next.js standalone 生产服务
+#
+# 安装方法（服务器上以 root 执行）：
+#   1. 复制本文件到 systemd 目录：
+#      cp /var/www/zhinanguanxin/scripts/deploy/zhinanguanxin.service /etc/systemd/system/
+#   2. 重载 systemd：
+#      systemctl daemon-reload
+#   3. 启用开机自启 + 立即启动：
+#      systemctl enable --now zhinanguanxin
+#   4. 查看状态：
+#      systemctl status zhinanguanxin
+#      journalctl -u zhinanguanxin -f
+#
+# 重要：生产环境 .env 里的 DATABASE_URL 必须用绝对路径，例如：
+#   DATABASE_URL="file:/var/www/zhinanguanxin/prisma/dev.db"
+# 否则 standalone 模式下 Prisma 会按工作目录解析相对路径，找不到数据库。
+
+[Unit]
+Description=知南观心知识库 (Next.js standalone)
+Documentation=https://github.com/chaoyu3141/kb-system-v7
+After=network.target
+
+[Service]
+Type=simple
+
+# 运行用户：当前为 root（个人服务器，简化权限管理）
+# 如需更安全，可改为专用用户：
+#   useradd -r -s /usr/sbin/nologin zhinanguanxin
+#   然后取消下面两行注释，并在 deploy.sh 构建后 chown
+User=root
+Group=root
+
+# 工作目录：项目根目录（便于相对路径解析）
+WorkingDirectory=/var/www/zhinanguanxin
+
+# 启动命令：运行 standalone server.js
+ExecStart=/usr/bin/node .next/standalone/server.js
+
+# 环境变量文件
+EnvironmentFile=/var/www/zhinanguanxin/.env
+
+# 运行时环境变量（覆盖/补充 .env）
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOSTNAME=127.0.0.1
+
+# 重启策略
+Restart=on-failure
+RestartSec=5
+StartLimitInterval=60
+StartLimitBurst=5
+
+# 标准输出/错误写入 journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zhinanguanxin
+
+# ---- 安全加固 ----
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# 注意：不能用 ProtectSystem=strict 或 ReadOnlyPaths=/var，因为要写数据库
+# 如需更强隔离，改用专用用户 + 精细的 ReadWritePaths 配置
+
+[Install]
+WantedBy=multi-user.target
