@@ -518,9 +518,9 @@ cmd_preflight() {
   local will_sync_prisma=false
   local incoming_changes=""
 
-  preflight_pass() { printf '  \033[1;32m✓\033[0m %s\n' "$1"; ((pass_count++)); }
-  preflight_fail() { printf '  \033[1;31m✗\033[0m %s\n' "$1"; ((fail_count++)); }
-  preflight_warn() { printf '  \033[1;33m!\033[0m %s\n' "$1"; ((warn_count++)); }
+  preflight_pass() { printf '  \033[1;32m✓\033[0m %s\n' "$1"; ((++pass_count)); }
+  preflight_fail() { printf '  \033[1;31m✗\033[0m %s\n' "$1"; ((++fail_count)); }
+  preflight_warn() { printf '  \033[1;33m!\033[0m %s\n' "$1"; ((++warn_count)); }
 
   printf '\n========================================\n'
   printf ' %s 部署预检（Dry Run）\n' "$APP_DISPLAY_NAME"
