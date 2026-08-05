@@ -82,22 +82,69 @@ export async function assertPublicHost(url: URL): Promise<void> {
   }
 }
 
-export function buildFetchHeaders(url: URL): Record<string, string> {
+export function buildFetchHeaders(
+  url: URL,
+  cookieHeader?: string,
+): Record<string, string> {
   const host = url.hostname.toLowerCase()
   const headers: Record<string, string> = {
     'User-Agent':
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    Accept:
+      'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Cache-Control': 'max-age=0',
+    Connection: 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+  }
+
+  if (cookieHeader) {
+    headers.Cookie = cookieHeader
   }
 
   if (host.includes('zhihu.com')) {
     headers.Referer = 'https://www.zhihu.com/'
+    headers['Sec-Fetch-Site'] = 'same-origin'
   } else if (host.includes('weixin.qq.com') || host.includes('mp.weixin.qq.com')) {
     headers.Referer = 'https://mp.weixin.qq.com/'
+    headers['Sec-Fetch-Site'] = 'same-origin'
   } else if (host.includes('jianshu.com')) {
     headers.Referer = 'https://www.jianshu.com/'
+    headers['Sec-Fetch-Site'] = 'same-origin'
   }
 
   return headers
+}
+
+/** Merge Set-Cookie values into a simple name=value cookie jar. */
+export function mergeSetCookie(jar: Map<string, string>, res: Response): void {
+  const headers = res.headers as Headers & { getSetCookie?: () => string[] }
+  const rawList =
+    typeof headers.getSetCookie === 'function'
+      ? headers.getSetCookie()
+      : (() => {
+          const single = res.headers.get('set-cookie')
+          return single ? [single] : []
+        })()
+
+  for (const raw of rawList) {
+    const pair = raw.split(';')[0]?.trim()
+    if (!pair) continue
+    const eq = pair.indexOf('=')
+    if (eq <= 0) continue
+    const name = pair.slice(0, eq).trim()
+    const value = pair.slice(eq + 1).trim()
+    if (name) jar.set(name, value)
+  }
+}
+
+export function cookieHeaderFromJar(jar: Map<string, string>): string | undefined {
+  if (jar.size === 0) return undefined
+  return Array.from(jar.entries())
+    .map(([name, value]) => `${name}=${value}`)
+    .join('; ')
 }

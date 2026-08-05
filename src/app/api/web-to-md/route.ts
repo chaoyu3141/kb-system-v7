@@ -3,6 +3,8 @@ import { getCurrentUser } from '@/lib/auth/session'
 import {
   assertPublicHost,
   buildFetchHeaders,
+  cookieHeaderFromJar,
+  mergeSetCookie,
   validateFetchUrl,
 } from '@/lib/markdown/web-to-md/sanitize-url'
 
@@ -35,13 +37,16 @@ export async function POST(req: NextRequest) {
     const timeout = setTimeout(() => controller.abort(), 25000)
 
     // Follow redirects manually so each hop is re-validated (SSRF-safe).
+    // Preserve cookies across hops to match browser / previous auto-follow behavior.
+    const cookieJar = new Map<string, string>()
     let res: Response | null = null
     for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
       res = await fetch(currentUrl.toString(), {
-        headers: buildFetchHeaders(currentUrl),
+        headers: buildFetchHeaders(currentUrl, cookieHeaderFromJar(cookieJar)),
         signal: controller.signal,
         redirect: 'manual',
       })
+      mergeSetCookie(cookieJar, res)
 
       if (res.status < 300 || res.status >= 400) break
 
