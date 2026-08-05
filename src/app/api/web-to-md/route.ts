@@ -6,6 +6,8 @@ import {
   validateFetchUrl,
 } from '@/lib/markdown/web-to-md/sanitize-url'
 
+const MAX_REDIRECTS = 5
+
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser()
   if (!user) return NextResponse.json({ error: '未登录' }, { status: 401 })
@@ -14,16 +16,16 @@ export async function POST(req: NextRequest) {
   const rawUrl = body.url as string
   if (!rawUrl) return NextResponse.json({ error: '缺少 URL' }, { status: 400 })
 
-  let parsedUrl: URL
+  let currentUrl: URL
   try {
-    parsedUrl = validateFetchUrl(rawUrl)
+    currentUrl = validateFetchUrl(rawUrl)
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : 'URL 无效' }, { status: 400 })
   }
 
   try {
     // Defense against DNS rebinding: resolve and reject private IPs.
-    await assertPublicHost(parsedUrl)
+    await assertPublicHost(currentUrl)
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : 'URL 无效' }, { status: 400 })
   }
@@ -32,21 +34,54 @@ export async function POST(req: NextRequest) {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 25000)
 
-    // Do NOT follow redirects automatically; if a redirect is returned,
-    // the caller must re-submit the final URL (which is re-validated).
-    const res = await fetch(parsedUrl.toString(), {
-      headers: buildFetchHeaders(parsedUrl),
-      signal: controller.signal,
-      redirect: 'manual',
-    })
+    // Follow redirects manually so each hop is re-validated (SSRF-safe).
+    let res: Response | null = null
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      res = await fetch(currentUrl.toString(), {
+        headers: buildFetchHeaders(currentUrl),
+        signal: controller.signal,
+        redirect: 'manual',
+      })
+
+      if (res.status < 300 || res.status >= 400) break
+
+      if (hop === MAX_REDIRECTS) {
+        clearTimeout(timeout)
+        return NextResponse.json(
+          { error: '重定向次数过多，请直接粘贴最终网页地址' },
+          { status: 400 },
+        )
+      }
+
+      const location = res.headers.get('location')
+      if (!location) {
+        clearTimeout(timeout)
+        return NextResponse.json(
+          { error: '目标存在重定向但缺少 Location，请直接粘贴最终网页地址' },
+          { status: 400 },
+        )
+      }
+
+      let nextUrl: URL
+      try {
+        // Resolve relative Location against the current URL, then re-validate.
+        nextUrl = validateFetchUrl(new URL(location, currentUrl).toString())
+        await assertPublicHost(nextUrl)
+      } catch (e) {
+        clearTimeout(timeout)
+        return NextResponse.json(
+          { error: e instanceof Error ? e.message : '重定向目标无效' },
+          { status: 400 },
+        )
+      }
+
+      currentUrl = nextUrl
+    }
+
     clearTimeout(timeout)
 
-    // Treat 3xx as disallowed to avoid redirect-based SSRF bypass.
-    if (res.status >= 300 && res.status < 400) {
-      return NextResponse.json(
-        { error: '目标存在重定向，请直接粘贴最终网页地址' },
-        { status: 400 },
-      )
+    if (!res) {
+      return NextResponse.json({ error: '抓取失败，请尝试手动粘贴 HTML' }, { status: 502 })
     }
 
     if (!res.ok) {
@@ -66,7 +101,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: '网页内容为空或过短' }, { status: 502 })
     }
 
-    return NextResponse.json({ html, url: parsedUrl.toString() })
+    return NextResponse.json({ html, url: currentUrl.toString() })
   } catch (e) {
     const message = e instanceof Error ? e.message : '抓取失败'
     return NextResponse.json(
@@ -75,4 +110,3 @@ export async function POST(req: NextRequest) {
     )
   }
 }
-
